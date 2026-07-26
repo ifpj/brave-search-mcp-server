@@ -22,7 +22,7 @@ RUN adduser -D -u 1000 mcp && chown -R mcp:mcp /app
 USER mcp
 
 # Expose port
-EXPOSE 3000
+EXPOSE 8080
 
 # Run the binary
 ENTRYPOINT ["/usr/local/bin/brave-search-mcp-server"]

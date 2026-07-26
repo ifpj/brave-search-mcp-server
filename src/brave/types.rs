@@ -243,11 +243,3 @@ pub struct LocalDescription {
     pub opening_hours: Option<Value>,
     pub rating_count: Option<i64>,
 }
-
-// ─── LLM Context Response ───────────────────────────────────────
-
-/// Pass-through as raw JSON value.
-pub type LlmContextResponse = Value;
-
-/// Pass-through as raw JSON value.
-pub type PlaceSearchResponse = Value;
