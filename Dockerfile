@@ -1,7 +1,5 @@
 # Build stage
-FROM rust:1.85-alpine AS builder
-
-RUN apk add --no-cache musl-dev openssl-dev pkgconfig
+FROM rust:1.88-alpine AS builder
 
 WORKDIR /app
 
@@ -23,7 +21,7 @@ RUN touch src/main.rs && cargo build --release
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates openssl
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
