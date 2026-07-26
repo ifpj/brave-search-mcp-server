@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  brave-search-mcp:
+    build: .
+    container_name: brave-search-mcp-server
+    ports:
+      - "3000:3000"
+    environment:
+      - BRAVE_API_KEYS=${BRAVE_API_KEYS}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=3000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
