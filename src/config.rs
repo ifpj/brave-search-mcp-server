@@ -1,4 +1,6 @@
 use clap::Parser;
+use std::fs;
+use std::path::PathBuf;
 
 /// Brave Search MCP Server configuration.
 #[derive(Parser, Debug, Clone)]
@@ -12,6 +14,10 @@ pub struct Config {
         alias = "brave-api-key"
     )]
     pub brave_api_keys: Vec<String>,
+
+    /// Path to file containing Brave API keys (one per line, supports # comments).
+    #[arg(long, env = "BRAVE_API_KEYS_FILE", alias = "brave-api-keys-file")]
+    pub brave_api_keys_file: Option<PathBuf>,
 
     /// Host to bind to.
     #[arg(long, env = "BRAVE_MCP_HOST", default_value = "127.0.0.1")]
@@ -43,6 +49,35 @@ pub struct Config {
 }
 
 impl Config {
+    /// Loads API keys from file if specified, merging with command-line keys.
+    /// File format: one key per line, lines starting with # are comments, empty lines are ignored.
+    pub fn load_keys(&mut self) -> Result<(), String> {
+        if let Some(ref path) = self.brave_api_keys_file {
+            let content = fs::read_to_string(path).map_err(|e| {
+                format!("Failed to read keys file '{}': {}", path.display(), e)
+            })?;
+
+            let file_keys: Vec<String> = content
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect();
+
+            if file_keys.is_empty() {
+                return Err(format!(
+                    "No valid keys found in file '{}'",
+                    path.display()
+                ));
+            }
+
+            // Merge file keys with command-line keys (file keys first)
+            let mut all_keys = file_keys;
+            all_keys.extend(self.brave_api_keys.drain(..));
+            self.brave_api_keys = all_keys;
+        }
+        Ok(())
+    }
+
     /// Returns true if the given tool name is permitted by the user's enable/disable lists.
     pub fn is_tool_permitted(&self, tool_name: &str) -> bool {
         if !self.enabled_tools.is_empty() {
@@ -56,7 +91,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.brave_api_keys.is_empty() {
             return Err(
-                "At least one Brave API key is required via --brave-api-keys or BRAVE_API_KEYS"
+                "At least one Brave API key is required via --brave-api-keys, --brave-api-keys-file, or BRAVE_API_KEYS"
                     .into(),
             );
         }

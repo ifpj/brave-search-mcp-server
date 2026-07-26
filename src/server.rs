@@ -23,6 +23,8 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/health", get(health_check))
+        .route("/keys", get(handle_key_stats))
+        .route("/keys/summary", get(handle_key_summary))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -34,6 +36,16 @@ pub fn create_router(state: AppState) -> Router {
 
 async fn health_check() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn handle_key_stats(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "keys": state.brave_client.key_stats()
+    }))
+}
+
+async fn handle_key_summary(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.brave_client.key_summary())
 }
 
 async fn handle_mcp(
