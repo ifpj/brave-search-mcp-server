@@ -7,154 +7,144 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+  packages: write
+
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-binaries:
+  build:
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: brave-search-mcp-server-linux-amd64
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            name: brave-search-mcp-server-linux-amd64-static
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: brave-search-mcp-server-linux-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: brave-search-mcp-server-darwin-amd64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: brave-search-mcp-server-darwin-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: brave-search-mcp-server-windows-amd64.exe
-
+          - target: aarch64-unknown-linux-musl
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools (Linux static)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      - name: Install cross
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall cross -y
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare artifact (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cp target/${{ matrix.target }}/release/brave-search-mcp-server ${{ matrix.name }}
-          chmod +x ${{ matrix.name }}
-          strip ${{ matrix.name }} || true
-
-      - name: Prepare artifact (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Copy-Item "target/${{ matrix.target }}/release/brave-search-mcp-server.exe" "${{ matrix.name }}"
+      - name: Build with cross
+        run: cross build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: "-C embed-bitcode=yes -C strip=symbols -C opt-level=z -C lto=true -C panic=abort -C codegen-units=1"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: brave-search-mcp-server-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/brave-search-mcp-server
+          if-no-files-found: error
 
-  build-docker:
-    name: Build Docker Image
+  docker:
+    name: Build and Push Docker
+    needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: slug
+        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brave-search-mcp-server-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release
+
+      - name: Download aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brave-search-mcp-server-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release
+
+      - name: Fix permissions
+        run: |
+          chmod +x target/x86_64-unknown-linux-musl/release/brave-search-mcp-server
+          chmod +x target/aarch64-unknown-linux-musl/release/brave-search-mcp-server
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix=
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.slug.outputs.sha8 }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
   release:
     name: Create Release
-    needs: [build-binaries, build-docker]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Get short SHA
+        id: slug
+        run: echo "sha8=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
         with:
-          files: |
-            brave-search-mcp-server-linux-amd64/brave-search-mcp-server-linux-amd64
-            brave-search-mcp-server-linux-amd64-static/brave-search-mcp-server-linux-amd64-static
-            brave-search-mcp-server-linux-arm64/brave-search-mcp-server-linux-arm64
-            brave-search-mcp-server-darwin-amd64/brave-search-mcp-server-darwin-amd64
-            brave-search-mcp-server-darwin-arm64/brave-search-mcp-server-darwin-arm64
-            brave-search-mcp-server-windows-amd64.exe/brave-search-mcp-server-windows-amd64.exe
-          draft: false
+          name: brave-search-mcp-server-x86_64-unknown-linux-musl
+          path: artifacts/x86_64
+
+      - name: Download aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brave-search-mcp-server-aarch64-unknown-linux-musl
+          path: artifacts/aarch64
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release_assets
+          cp artifacts/x86_64/brave-search-mcp-server release_assets/brave-search-mcp-server-linux-amd64
+          cp artifacts/aarch64/brave-search-mcp-server release_assets/brave-search-mcp-server-linux-arm64
+          chmod +x release_assets/*
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sha-${{ steps.slug.outputs.sha8 }}
+          name: "Release ${{ steps.slug.outputs.sha8 }}"
+          body: "Build for commit ${{ github.sha }} (${{ steps.slug.outputs.sha8 }})"
           prerelease: false
-          generate_release_notes: true
+          files: release_assets/*
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

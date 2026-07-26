@@ -1,34 +1,21 @@
-# Build stage
-FROM rust:1.88-slim AS builder
+FROM alpine:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
 
-WORKDIR /app
-
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
-
-# Create dummy source to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build dependencies
-RUN cargo build --release
-
-# Copy actual source code
-COPY src ./src
-
-# Build the application
-RUN touch src/main.rs && cargo build --release
-
-# Runtime stage
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/target/release/brave-search-mcp-server /usr/local/bin/
+# Copy pre-built binary based on architecture
+COPY target/x86_64-unknown-linux-musl/release/brave-search-mcp-server /usr/local/bin/brave-search-mcp-server-amd64
+COPY target/aarch64-unknown-linux-musl/release/brave-search-mcp-server /usr/local/bin/brave-search-mcp-server-arm64
+
+# Select the correct binary for this architecture
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      ln -s /usr/local/bin/brave-search-mcp-server-arm64 /usr/local/bin/brave-search-mcp-server; \
+    else \
+      ln -s /usr/local/bin/brave-search-mcp-server-amd64 /usr/local/bin/brave-search-mcp-server; \
+    fi
 
 # Create non-root user
 RUN adduser -D -u 1000 mcp && chown -R mcp:mcp /app
