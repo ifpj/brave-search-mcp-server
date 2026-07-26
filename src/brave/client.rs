@@ -76,20 +76,20 @@ impl KeyState {
     }
 
     /// Check if this key is currently available (not in cooldown)
-    fn is_available(&self) -> bool {
-        let now = Instant::now().elapsed().as_secs() as i64;
+    fn is_available(&self, now: i64) -> bool {
         let cooldown = self.cooldown_until.load(Ordering::Relaxed);
         now >= cooldown
     }
 
     /// Mark this key as rate-limited with exponential backoff
-    fn mark_rate_limited(&self) {
+    fn mark_rate_limited(&self, now: i64) {
         let failures = self.failure_count.fetch_add(1, Ordering::Relaxed);
+        let exponent = std::cmp::min(failures, 6) as u32;
         let backoff_secs = std::cmp::min(
-            COOLDOWN_BASE.as_secs() * 2u64.pow(failures as u32),
+            COOLDOWN_BASE.as_secs() * 2u64.pow(exponent),
             COOLDOWN_MAX.as_secs(),
         );
-        let cooldown_until = Instant::now().elapsed().as_secs() as i64 + backoff_secs as i64;
+        let cooldown_until = now + backoff_secs as i64;
         self.cooldown_until.store(cooldown_until, Ordering::Relaxed);
         warn!(
             key = %self.key_masked(),
@@ -100,13 +100,13 @@ impl KeyState {
     }
 
     /// Mark this key as failed (auth error, etc.)
-    fn mark_failed(&self, error: String) {
+    fn mark_failed(&self, now: i64, error: String) {
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut last_error) = self.last_error.write() {
             *last_error = Some(error.clone());
         }
         // Disable key permanently on auth errors
-        let cooldown_until = Instant::now().elapsed().as_secs() as i64 + COOLDOWN_MAX.as_secs() as i64 * 24;
+        let cooldown_until = now + COOLDOWN_MAX.as_secs() as i64 * 24;
         self.cooldown_until.store(cooldown_until, Ordering::Relaxed);
         error!(
             key = %self.key_masked(),
@@ -134,12 +134,12 @@ impl KeyState {
     }
 
     /// Get statistics for this key
-    fn stats(&self) -> KeyStats {
+    fn stats(&self, now: i64) -> KeyStats {
         KeyStats {
             key_masked: self.key_masked(),
             success_count: self.success_count.load(Ordering::Relaxed),
             failure_count: self.failure_count.load(Ordering::Relaxed),
-            is_available: self.is_available(),
+            is_available: self.is_available(now),
             last_error: self.last_error.read().ok().and_then(|e| e.clone()),
         }
     }
@@ -159,27 +159,35 @@ pub struct KeyStats {
 pub struct KeyPool {
     keys: Vec<KeyState>,
     counter: AtomicUsize,
+    epoch: Instant,
 }
 
 impl KeyPool {
     pub fn new(keys: Vec<String>) -> Self {
+        let epoch = Instant::now();
         let key_states = keys.into_iter().map(KeyState::new).collect();
         Self {
             keys: key_states,
             counter: AtomicUsize::new(0),
+            epoch,
         }
+    }
+
+    fn now_secs(&self) -> i64 {
+        self.epoch.elapsed().as_secs() as i64
     }
 
     /// Get the next available key, skipping rate-limited ones
     pub fn next_key(&self) -> Option<&KeyState> {
         let len = self.keys.len();
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
+        let now = self.now_secs();
 
         // Try up to len times to find an available key
         for i in 0..len {
             let idx = (start + i) % len;
             let key_state = &self.keys[idx];
-            if key_state.is_available() {
+            if key_state.is_available(now) {
                 debug!(
                     key = %key_state.key_masked(),
                     index = idx,
@@ -195,15 +203,17 @@ impl KeyPool {
 
     /// Get statistics for all keys
     pub fn stats(&self) -> Vec<KeyStats> {
-        self.keys.iter().map(|k| k.stats()).collect()
+        let now = self.now_secs();
+        self.keys.iter().map(|k| k.stats(now)).collect()
     }
 
     /// Get summary statistics
     pub fn summary(&self) -> KeyPoolSummary {
         let total = self.keys.len();
-        let available = self.keys.iter().filter(|k| k.is_available()).count();
-        let total_success: u64 = self.keys.iter().map(|k| k.stats().success_count).sum();
-        let total_failure: u64 = self.keys.iter().map(|k| k.stats().failure_count).sum();
+        let now = self.now_secs();
+        let available = self.keys.iter().filter(|k| k.is_available(now)).count();
+        let total_success: u64 = self.keys.iter().map(|k| k.stats(now).success_count).sum();
+        let total_failure: u64 = self.keys.iter().map(|k| k.stats(now).failure_count).sum();
 
         KeyPoolSummary {
             total_keys: total,
@@ -281,6 +291,8 @@ impl BraveClient {
 
         // Retry loop with key rotation
         for attempt in 0..MAX_RETRIES {
+            let now = self.key_pool.now_secs();
+
             // Get next available key
             let key_state = match self.key_pool.next_key() {
                 Some(key) => key,
@@ -310,8 +322,13 @@ impl BraveClient {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    key_state.mark_failed(format!("Network error: {}", e));
-                    continue; // Try next key
+                    warn!(
+                        key = %key_state.key_masked(),
+                        error = %e,
+                        "Network error, rotating key"
+                    );
+                    key_state.mark_rate_limited(now);
+                    continue;
                 }
             };
 
@@ -330,7 +347,7 @@ impl BraveClient {
 
             // Rate limited (429) - mark key and retry with next key
             if status == StatusCode::TOO_MANY_REQUESTS {
-                key_state.mark_rate_limited();
+                key_state.mark_rate_limited(now);
                 debug!(
                     attempt = attempt + 1,
                     key = %key_state.key_masked(),
@@ -342,7 +359,7 @@ impl BraveClient {
             // Auth errors (401/403) - disable this key permanently
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 let body = response.text().await.unwrap_or_default();
-                key_state.mark_failed(format!("Auth error {}: {}", status, body));
+                key_state.mark_failed(now, format!("Auth error {}: {}", status, body));
                 error!(
                     key = %key_state.key_masked(),
                     status = %status,
@@ -353,7 +370,7 @@ impl BraveClient {
 
             // Other HTTP errors - return immediately (don't retry)
             let body = response.text().await.unwrap_or_default();
-            key_state.mark_failed(format!("HTTP {}: {}", status, body));
+            key_state.mark_failed(now, format!("HTTP {}: {}", status, body));
             return Err(BraveApiError::Http {
                 status: status.as_u16(),
                 body,

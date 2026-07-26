@@ -61,13 +61,11 @@ pub async fn execute(client: &BraveClient, params: Value) -> Result<ToolResult, 
                     return Ok(ToolResult::text(vec![summary_text]));
                 }
             }
-            Err(_) => {
-                // Sleep and retry
-                sleep(Duration::from_millis(50)).await;
-            }
+            Err(_) => {}
         }
 
         attempts -= 1;
+        sleep(Duration::from_millis(50)).await;
     }
 
     Ok(ToolResult::error("Unable to retrieve a Summarizer summary.".into()))
