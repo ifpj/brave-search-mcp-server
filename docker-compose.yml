@@ -1,6 +1,6 @@
 services:
   brave-search-mcp:
-    build: .
+    image: ghcr.io/ifpj/brave-search-mcp-server:latest
     container_name: brave-search-mcp-server
     ports:
       - "8080:8080"
